@@ -12,6 +12,7 @@
 
 import io
 import zipfile
+import json
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -521,16 +522,9 @@ def backtest(
     proba=None,
     proba_thresh=0.55,
 ):
-    # Defensive checks (prevents "NoneType has no attribute copy" crashes)
-    if df is None or not isinstance(df, pd.DataFrame):
-        raise ValueError(
-            f"backtest expected a pandas DataFrame, got {type(df)}. "
-            "This usually means compute_signals returned None or a cached result is corrupted. "
-            "Click 'Clear cache' in the sidebar and rerun, and ensure you deployed the correct app file."
-        )
-    if df.empty:
-        return df, pd.DataFrame()
-
+    # Defensive: make failures explicit (Streamlit Cloud may redact exceptions)
+    if df is None or (not isinstance(df, pd.DataFrame)):
+        raise AttributeError("backtest() expected a pandas DataFrame, got None/invalid input.")
     d = df.copy()
     d["ATR"] = atr(d, atr_len)
 
@@ -1431,16 +1425,6 @@ d_sig = compute_signals(
     roc_len=int(roc_len),
     vol_len=int(vol_len),
     range_len=int(range_len),
-
-# Sanity-check signals dataframe before running ML/backtest
-if d_sig is None or (not isinstance(d_sig, pd.DataFrame)) or d_sig.empty:
-    st.error(
-        "Signals dataframe is empty/invalid. This can happen if the timeframe/date range produces no candles, "
-        "or if you deployed an older file missing `return x` in compute_signals. "
-        "Try: (1) widen the date range, (2) switch timeframe to match your data, (3) click Clear cache, then reload."
-    )
-    st.stop()
-
     break_close=bool(break_close),
     bb_len=int(bb_len),
     bb_k=float(bb_k),
@@ -1451,6 +1435,14 @@ if d_sig is None or (not isinstance(d_sig, pd.DataFrame)) or d_sig.empty:
     weights=weights,
     min_score=float(min_score),
 )
+# Sanity-check signals dataframe before running ML/backtest
+if d_sig is None or (not isinstance(d_sig, pd.DataFrame)) or d_sig.empty:
+    st.error(
+        "Signals dataframe is empty/invalid. This can happen if your timeframe/date range produces no candles, "
+        "or if compute_signals() did not return a DataFrame. "
+        "Try widening the date range, switching timeframe, or re-uploading data."
+    )
+    st.stop()
 
 # ML
 proba = None
