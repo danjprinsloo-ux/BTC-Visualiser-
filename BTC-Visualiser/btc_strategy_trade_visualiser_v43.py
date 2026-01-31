@@ -1,4 +1,4 @@
-# BTC Strategy Trade Visualiser (v5.1)
+# BTC Strategy Trade Visualiser (v4.9)
 # Upgrades included:
 # - Multi-strategy engine
 # - Strategy-specific exits (AUTO + override)
@@ -12,85 +12,12 @@
 
 import io
 import zipfile
-import json
-import calendar
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-st.set_page_config(page_title="BTC Strategy Trade Visualiser (v5.1)", layout="wide", initial_sidebar_state="expanded")
-
-# =====================
-# UI THEME (light/dark + accent) — app-level CSS
-# =====================
-def apply_ui_theme(theme_mode: str, accent_hex: str):
-    """Lightweight CSS theming + Plotly template selection."""
-    theme_mode = (theme_mode or "Dark").strip().lower()
-    accent_hex = accent_hex or "#00D1B2"
-
-    if theme_mode.startswith("light"):
-        bg = "#f6f7fb"
-        panel = "#ffffff"
-        text = "#111827"
-        subtle = "#6b7280"
-        border = "rgba(0,0,0,0.08)"
-        plotly_template = "plotly_white"
-    else:
-        bg = "#0b1220"
-        panel = "#0f172a"
-        text = "#e5e7eb"
-        subtle = "#9ca3af"
-        border = "rgba(255,255,255,0.10)"
-        plotly_template = "plotly_dark"
-
-    css = f"""
-    <style>
-      .stApp {{
-        background: {bg};
-        color: {text};
-      }}
-
-      .block-container {{
-        padding-top: 1.2rem;
-        padding-bottom: 2.2rem;
-      }}
-
-      h1, h2, h3, h4, h5, h6, p, li, label {{
-        color: {text};
-      }}
-
-      section[data-testid="stSidebar"] > div {{
-        background: {panel};
-        border-right: 1px solid {border};
-      }}
-
-      .stButton>button {{
-        border-radius: 10px;
-        border: 1px solid {border};
-        background: {accent_hex};
-        color: white;
-        font-weight: 650;
-      }}
-      .stButton>button:hover {{
-        filter: brightness(0.95);
-        border-color: {accent_hex};
-      }}
-
-      div[data-testid="stDataFrame"] {{
-        border: 1px solid {border};
-        border-radius: 12px;
-        overflow: hidden;
-      }}
-
-      .muted {{
-        color: {subtle};
-        font-size: 0.92rem;
-      }}
-    </style>
-    """
-    st.markdown(css, unsafe_allow_html=True)
-    return plotly_template
+st.set_page_config(page_title="BTC Strategy Trade Visualiser (v4.9)", layout="wide")
 
 # =====================
 # LOADER
@@ -329,39 +256,22 @@ def compute_signals(
     x["sig_tag"] = ""
     x["score"] = 0.0
 
+    def apply_score(mask_long: pd.Series, mask_short: pd.Series, parts_df: pd.DataFrame, tag_long: str, tag_short: str):
+        parts_keys = list(parts_df.columns)
+        for k in parts_keys:
+            x[f"score_{k}"] = parts_df[k].astype(float)
 
-def apply_score(mask_long: pd.Series, mask_short: pd.Series, parts_df: pd.DataFrame, tag_long: str, tag_short: str):
-    # Store raw strategy triggers (before score filtering)
-    x["raw_long"] = mask_long.astype(bool)
-    x["raw_short"] = mask_short.astype(bool)
+        scores = []
+        for i in range(len(x)):
+            parts = {k: float(parts_df.iloc[i][k]) for k in parts_keys}
+            scores.append(normalize_score(parts, weights))
+        x["score"] = np.array(scores, dtype=float)
 
-    parts_keys = list(parts_df.columns)
-
-    # Save per-component normalized values (0..1)
-    for k in parts_keys:
-        x[f"score_{k}"] = parts_df[k].astype(float)
-
-    # Vectorized score (0..100): weighted average of components in [0,1]
-    w = np.array([float(weights.get(k, 0.0)) for k in parts_keys], dtype=float)
-    vals = parts_df[parts_keys].to_numpy(dtype=float)
-    vals = np.clip(vals, 0.0, 1.0)
-
-    use = w > 0
-    if np.any(use):
-        ssum = vals[:, use] @ w[use]
-        wsum = float(w[use].sum())
-        x["score"] = (ssum / max(1e-12, wsum)) * 100.0
-    else:
-        x["score"] = 0.0
-
-    ok = x["score"] >= float(min_score)
-    x["long_sig"] = mask_long & ok
-    x["short_sig"] = mask_short & ok
-    x.loc[x["long_sig"], "sig_tag"] = tag_long
-    x.loc[x["short_sig"], "sig_tag"] = tag_short
-
-    # Save component list for later drill-down (same for all rows)
-    x["score_components"] = ",".join(parts_keys)
+        ok = x["score"] >= float(min_score)
+        x["long_sig"] = mask_long & ok
+        x["short_sig"] = mask_short & ok
+        x.loc[x["long_sig"], "sig_tag"] = tag_long
+        x.loc[x["short_sig"], "sig_tag"] = tag_short
 
     if strategy_name == "MA Crossover":
         x["FAST"] = sma(x["close"], fast)
@@ -610,29 +520,21 @@ def backtest(
     use_ml=False,
     proba=None,
     proba_thresh=0.55,
-    # position sizing
-    sizing_mode="Fixed $ risk",
-    start_balance=10_000.0,
-    risk_pct=1.0,
-    leverage_cap=10.0,
-    min_pos_usd=0.0,
-    max_pos_usd=1_000_000.0,
-    compound=True,
 ):
+    # Defensive checks (prevents "NoneType has no attribute copy" crashes)
+    if df is None or not isinstance(df, pd.DataFrame):
+        raise ValueError(
+            f"backtest expected a pandas DataFrame, got {type(df)}. "
+            "This usually means compute_signals returned None or a cached result is corrupted. "
+            "Click 'Clear cache' in the sidebar and rerun, and ensure you deployed the correct app file."
+        )
+    if df.empty:
+        return df, pd.DataFrame()
+
     d = df.copy()
     d["ATR"] = atr(d, atr_len)
 
     trades = []
-    equity = float(start_balance)
-    equity_before = np.nan
-    qty = 0.0
-    notional = 0.0
-    risk_target = float(risk)
-    risk_actual = np.nan
-    leverage_used = np.nan
-    size_capped = False
-    min_forced = False
-
     pos = 0
     entry = sl = tp = None
     entry_time = None
@@ -641,12 +543,6 @@ def backtest(
     signal_tag = None
     bars_in_trade = 0
     trail = None
-
-    mfe = 0.0
-    mae = 0.0
-    entry_atr = None
-    entry_score = None
-    entry_snapshot_json = None
 
     start_i = max(atr_len, 5) + 2
     end_limit = len(d) - 2 if fill_next_open else len(d) - 1
@@ -689,20 +585,6 @@ def backtest(
             bars_in_trade = 0
             trail = None
 
-            mfe = 0.0
-            mae = 0.0
-            entry_atr = None
-            entry_score = None
-            entry_snapshot_json = None
-            qty = 0.0
-            notional = 0.0
-            risk_target = float(risk)
-            risk_actual = np.nan
-            leverage_used = np.nan
-            equity_before = np.nan
-            size_capped = False
-            min_forced = False
-
             if long_sig and allowed():
                 pos = 1
                 entry = float(fill_price)
@@ -716,108 +598,6 @@ def backtest(
 
                 if exit_model == "ATR Trailing Stop":
                     trail = entry - trail_atr_mult * float(row["ATR"])
-
-                # Position sizing (qty in BTC, pnl in quote currency)
-                equity_ref = float(equity) if bool(compound) else float(start_balance)
-                equity_before = float(equity_ref)
-
-                if str(sizing_mode).startswith("%"):
-                    risk_target = float(equity_ref) * (float(risk_pct) / 100.0)
-                else:
-                    risk_target = float(risk)
-
-                stop_dist = float(entry) - float(sl)
-                if stop_dist <= 0:
-                    # Invalid stop distance; skip this trade
-                    pos = 0
-                    entry = sl = tp = None
-                    entry_time = None
-                    signal_time = None
-                    signal_proba = None
-                    signal_tag = None
-                    continue
-
-                qty = (risk_target / stop_dist) if risk_target > 0 else 0.0
-                notional = qty * float(entry)
-
-                max_notional = float(max_pos_usd) if float(max_pos_usd) > 0 else float("inf")
-                min_notional = float(min_pos_usd) if float(min_pos_usd) > 0 else 0.0
-                max_lev_notional = float(equity_ref) * float(leverage_cap) if float(leverage_cap) > 0 else float("inf")
-                notional_limit = min(max_notional, max_lev_notional)
-
-                if notional > notional_limit:
-                    qty = notional_limit / float(entry)
-                    notional = qty * float(entry)
-                    size_capped = True
-
-                if min_notional > 0 and notional < min_notional:
-                    qty_min = min_notional / float(entry)
-                    qty_try = min(qty_min, notional_limit / float(entry))
-                    if qty_try > qty:
-                        qty = qty_try
-                        notional = qty * float(entry)
-                        min_forced = True
-
-                risk_actual = float(qty) * float(stop_dist)
-                leverage_used = (float(notional) / float(equity_ref)) if float(equity_ref) > 0 else np.nan
-
-                # Snapshot at signal candle (row = signal candle)
-                entry_atr = float(row["ATR"])
-                entry_score = float(row.get("score", np.nan))
-
-                # Build score breakdown
-                comp_names = str(row.get("score_components", "")).split(",") if "score_components" in row else []
-                comp_names = [c for c in comp_names if c]
-
-                wts = globals().get("weights", {})
-                wts = wts if isinstance(wts, dict) else {}
-
-                components = {}
-                contrib = {}
-                for c in comp_names:
-                    v = float(row.get(f"score_{c}", np.nan))
-                    w = float(wts.get(c, 0.0))
-                    components[c] = v
-                    contrib[c] = (v * w)
-
-                snapshot = {
-                    "strategy": str(globals().get("strategy_name", "")),
-                    "sig_tag": str(row.get("sig_tag", "")),
-                    "signal_time": str(row["dt"]),
-                    "entry_fill_mode": "next_open" if fill_next_open else "close",
-                    "min_score": float(globals().get("min_score", np.nan)),
-                    "score": entry_score,
-                    "raw_long": bool(row.get("raw_long", False)),
-                    "raw_short": bool(row.get("raw_short", False)),
-
-                    "position_sizing": {
-                        "mode": str(sizing_mode),
-                        "equity_ref": float(equity_before) if pd.notna(equity_before) else float(start_balance),
-                        "risk_target": float(risk_target) if pd.notna(risk_target) else np.nan,
-                        "risk_actual": float(risk_actual) if pd.notna(risk_actual) else np.nan,
-                        "qty": float(qty),
-                        "notional": float(notional),
-                        "leverage_used": float(leverage_used) if pd.notna(leverage_used) else np.nan,
-                        "leverage_cap": float(leverage_cap),
-                        "min_notional": float(min_pos_usd),
-                        "max_notional": float(max_pos_usd),
-                        "size_capped": bool(size_capped),
-                        "min_forced": bool(min_forced),
-                    },
-                    "indicators": {
-                        "RSI": float(row.get("RSI", np.nan)),
-                        "ROC": float(row.get("ROC", np.nan)),
-                        "VOL_EXP": bool(row.get("VOL_EXP", False)),
-                        "ATR": float(row.get("ATR", np.nan)),
-                    },
-                    "components": components,
-                    "weights": {k: float(v) for k, v in wts.items()},
-                    "contribution": contrib,
-                }
-
-                entry_snapshot_json = json.dumps(snapshot, ensure_ascii=False)
-                mfe = 0.0
-                mae = 0.0
 
             elif both_dirs and short_sig and allowed():
                 pos = -1
@@ -833,123 +613,11 @@ def backtest(
                 if exit_model == "ATR Trailing Stop":
                     trail = entry + trail_atr_mult * float(row["ATR"])
 
-                # Position sizing (qty in BTC, pnl in quote currency)
-                equity_ref = float(equity) if bool(compound) else float(start_balance)
-                equity_before = float(equity_ref)
-
-                if str(sizing_mode).startswith("%"):
-                    risk_target = float(equity_ref) * (float(risk_pct) / 100.0)
-                else:
-                    risk_target = float(risk)
-
-                stop_dist = float(sl) - float(entry)
-                if stop_dist <= 0:
-                    # Invalid stop distance; skip this trade
-                    pos = 0
-                    entry = sl = tp = None
-                    entry_time = None
-                    signal_time = None
-                    signal_proba = None
-                    signal_tag = None
-                    continue
-
-                qty = (risk_target / stop_dist) if risk_target > 0 else 0.0
-                notional = qty * float(entry)
-
-                max_notional = float(max_pos_usd) if float(max_pos_usd) > 0 else float("inf")
-                min_notional = float(min_pos_usd) if float(min_pos_usd) > 0 else 0.0
-                max_lev_notional = float(equity_ref) * float(leverage_cap) if float(leverage_cap) > 0 else float("inf")
-                notional_limit = min(max_notional, max_lev_notional)
-
-                if notional > notional_limit:
-                    qty = notional_limit / float(entry)
-                    notional = qty * float(entry)
-                    size_capped = True
-
-                if min_notional > 0 and notional < min_notional:
-                    qty_min = min_notional / float(entry)
-                    qty_try = min(qty_min, notional_limit / float(entry))
-                    if qty_try > qty:
-                        qty = qty_try
-                        notional = qty * float(entry)
-                        min_forced = True
-
-                risk_actual = float(qty) * float(stop_dist)
-                leverage_used = (float(notional) / float(equity_ref)) if float(equity_ref) > 0 else np.nan
-
-                # Snapshot at signal candle (row = signal candle)
-                entry_atr = float(row["ATR"])
-                entry_score = float(row.get("score", np.nan))
-
-                # Build score breakdown
-                comp_names = str(row.get("score_components", "")).split(",") if "score_components" in row else []
-                comp_names = [c for c in comp_names if c]
-
-                wts = globals().get("weights", {})
-                wts = wts if isinstance(wts, dict) else {}
-
-                components = {}
-                contrib = {}
-                for c in comp_names:
-                    v = float(row.get(f"score_{c}", np.nan))
-                    w = float(wts.get(c, 0.0))
-                    components[c] = v
-                    contrib[c] = (v * w)
-
-                snapshot = {
-                    "strategy": str(globals().get("strategy_name", "")),
-                    "sig_tag": str(row.get("sig_tag", "")),
-                    "signal_time": str(row["dt"]),
-                    "entry_fill_mode": "next_open" if fill_next_open else "close",
-                    "min_score": float(globals().get("min_score", np.nan)),
-                    "score": entry_score,
-                    "raw_long": bool(row.get("raw_long", False)),
-                    "raw_short": bool(row.get("raw_short", False)),
-
-                    "position_sizing": {
-                        "mode": str(sizing_mode),
-                        "equity_ref": float(equity_before) if pd.notna(equity_before) else float(start_balance),
-                        "risk_target": float(risk_target) if pd.notna(risk_target) else np.nan,
-                        "risk_actual": float(risk_actual) if pd.notna(risk_actual) else np.nan,
-                        "qty": float(qty),
-                        "notional": float(notional),
-                        "leverage_used": float(leverage_used) if pd.notna(leverage_used) else np.nan,
-                        "leverage_cap": float(leverage_cap),
-                        "min_notional": float(min_pos_usd),
-                        "max_notional": float(max_pos_usd),
-                        "size_capped": bool(size_capped),
-                        "min_forced": bool(min_forced),
-                    },
-                    "indicators": {
-                        "RSI": float(row.get("RSI", np.nan)),
-                        "ROC": float(row.get("ROC", np.nan)),
-                        "VOL_EXP": bool(row.get("VOL_EXP", False)),
-                        "ATR": float(row.get("ATR", np.nan)),
-                    },
-                    "components": components,
-                    "weights": {k: float(v) for k, v in wts.items()},
-                    "contribution": contrib,
-                }
-
-                entry_snapshot_json = json.dumps(snapshot, ensure_ascii=False)
-                mfe = 0.0
-                mae = 0.0
-
         else:
             if fill_next_open and row["dt"] < entry_time:
                 continue
 
             bars_in_trade += 1
-
-# Track excursion from entry using candle extremes
-            if pos == 1:
-                # favourable = high - entry, adverse = entry - low
-                mfe = max(mfe, float(row["high"]) - float(entry))
-                mae = max(mae, float(entry) - float(row["low"]))
-            else:
-                # short: favourable = entry - low, adverse = high - entry
-                mfe = max(mfe, float(entry) - float(row["low"]))
-                mae = max(mae, float(row["high"]) - float(entry))
 
             if exit_model == "ATR Trailing Stop" and trail is not None:
                 if pos == 1:
@@ -1041,16 +709,6 @@ def backtest(
                     rdist = sl - entry
                     r_mult = (entry - exit_price) / rdist if rdist > 0 else 0.0
 
-
-                # Real PnL ($) from position size (qty BTC)
-                if pos == 1:
-                    pnl = float(exit_price - entry) * float(qty)
-                else:
-                    pnl = float(entry - exit_price) * float(qty)
-
-                equity_after = float(equity) + float(pnl)
-                equity = float(equity_after)
-
                 trades.append(
                     {
                         "side": "LONG" if pos == 1 else "SHORT",
@@ -1067,23 +725,10 @@ def backtest(
                         "p_win": float(signal_proba) if signal_proba is not None and np.isfinite(signal_proba) else np.nan,
                         "r_mult": float(r_mult),
                         "pnl": float(pnl),
-                        "qty": float(qty),
-                        "notional": float(notional),
-                        "risk_target": float(risk_target) if pd.notna(risk_target) else np.nan,
-                        "risk_actual": float(risk_actual) if pd.notna(risk_actual) else np.nan,
-                        "equity_before": float(equity_before) if pd.notna(equity_before) else np.nan,
-                        "equity_after": float(equity_after) if "equity_after" in locals() else np.nan,
-                        "leverage_used": float(leverage_used) if pd.notna(leverage_used) else np.nan,
-                        "size_capped": bool(size_capped),
-                        "min_forced": bool(min_forced),
                         "outcome": outcome,
                         "exit_model": exit_model,
                         "bars_in_trade": int(bars_in_trade),
                         "score": float(row.get("score", np.nan)),
-                        "reason": entry_snapshot_json,
-                        "mfe": float(mfe),
-                        "mae": float(mae),
-                        "entry_atr": float(entry_atr) if entry_atr is not None else np.nan,
                     }
                 )
 
@@ -1095,18 +740,13 @@ def backtest(
                 signal_tag = None
                 bars_in_trade = 0
                 trail = None
-                mfe = 0.0
-                mae = 0.0
-                entry_atr = None
-                entry_score = None
-                entry_snapshot_json = None
 
     return d, pd.DataFrame(trades)
 
 
 @st.cache_data(show_spinner=False)
 def run_backtest_cached(
-    df,
+    df_view,
     atr_len,
     atr_mult,
     rr,
@@ -1121,16 +761,9 @@ def run_backtest_cached(
     use_ml,
     proba,
     proba_thresh,
-    sizing_mode,
-    start_balance,
-    risk_pct,
-    leverage_cap,
-    min_pos_usd,
-    max_pos_usd,
-    compound,
 ):
     return backtest(
-        df,
+        df_view,
         atr_len,
         atr_mult,
         rr,
@@ -1145,15 +778,10 @@ def run_backtest_cached(
         use_ml=use_ml,
         proba=proba,
         proba_thresh=proba_thresh,
-        sizing_mode=sizing_mode,
-        start_balance=start_balance,
-        risk_pct=risk_pct,
-        leverage_cap=leverage_cap,
-        min_pos_usd=min_pos_usd,
-        max_pos_usd=max_pos_usd,
-        compound=compound,
     )
 
+
+# =====================
 # WALK-FORWARD ML
 # =====================
 def walk_forward_proba(
@@ -1276,36 +904,6 @@ def add_session_overlays(fig, dts: pd.Series, show_asia=True, show_london=True, 
     return fig
 
 
-
-# =====================
-# CHART TRANSFORMS
-# =====================
-def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute Heikin Ashi OHLC from standard OHLC. Intended for chart display."""
-    if df.empty:
-        return df
-    o = df["open"].to_numpy(dtype=float)
-    h = df["high"].to_numpy(dtype=float)
-    l = df["low"].to_numpy(dtype=float)
-    c = df["close"].to_numpy(dtype=float)
-
-    ha_close = (o + h + l + c) / 4.0
-    ha_open = np.empty_like(ha_close)
-    ha_open[0] = (o[0] + c[0]) / 2.0
-    for i in range(1, len(ha_close)):
-        ha_open[i] = (ha_open[i - 1] + ha_close[i - 1]) / 2.0
-
-    ha_high = np.maximum.reduce([h, ha_open, ha_close])
-    ha_low = np.minimum.reduce([l, ha_open, ha_close])
-
-    out = df.copy()
-    out["open"] = ha_open
-    out["high"] = ha_high
-    out["low"] = ha_low
-    out["close"] = ha_close
-    return out
-
-
 # =====================
 # BEGINNER HELP
 # =====================
@@ -1318,195 +916,28 @@ def explain(label: str, what: str, up: str, down: str):
 # =====================
 # UI
 # =====================
-st.title("BTC Strategy Trade Visualiser (v5.1) — presets + sizing + chart styles + analytics")
-
-
-# =====================
-# SETTINGS PRESETS / SAVE-LOAD
-# =====================
-def _collect_ui_settings() -> dict:
-    return {k: v for k, v in st.session_state.items() if k.startswith("ui_")}
-
-def _apply_ui_settings(settings: dict, *, only_known: bool = True):
-    if not isinstance(settings, dict):
-        return
-    for k, v in settings.items():
-        if not str(k).startswith("ui_"):
-            continue
-        if only_known and (k not in st.session_state) and (k not in UI_KNOWN_KEYS):
-            continue
-        st.session_state[k] = v
-
-# Keys we allow to be set from presets/files (prevents accidental junk)
-UI_KNOWN_KEYS = {
-    "ui_theme_mode", "ui_accent_hex",
-    "ui_timeframe", "ui_strategy_name",
-    "ui_fast", "ui_slow", "ui_trend_len",
-    "ui_rsi_len", "ui_roc_len", "ui_momo_thr", "ui_vol_len", "ui_range_len", "ui_break_close",
-    "ui_bb_len", "ui_bb_k", "ui_sqz", "ui_vwap_session", "ui_vwap_dev",
-    "ui_min_score",
-    "ui_w_trend", "ui_w_rsi", "ui_w_vol", "ui_w_strength", "ui_w_compress", "ui_w_pullback", "ui_w_roc", "ui_w_wick", "ui_w_dev",
-    "ui_atr_len", "ui_atr_mult", "ui_rr",
-    "ui_sizing_mode", "ui_start_balance", "ui_risk", "ui_risk_pct", "ui_leverage_cap", "ui_min_pos_usd", "ui_max_pos_usd", "ui_compound",
-    "ui_both_dirs", "ui_exit_on_opp", "ui_fill_next_open", "ui_intrabar_rule",
-    "ui_exit_override", "ui_trail_atr_mult", "ui_time_stop_bars",
-    "ui_use_ml", "ui_ml_mode", "ui_train_frac", "ui_wf_train_bars", "ui_wf_test_bars", "ui_proba_thresh",
-    "ui_chart_height", "ui_chart_window", "ui_chart_last_n", "ui_chart_cap",
-    "ui_chart_style", "ui_show_indicators", "ui_show_ml_overlay",
-    "ui_marker_mode", "ui_marker_limit", "ui_show_sl_tp",
-    "ui_show_sessions", "ui_show_asia", "ui_show_london", "ui_show_ny", "ui_session_max_days", "ui_force_sessions",
-}
-
-PRESETS = {
-    "Trend (smoother, fewer trades)": {
-        "ui_strategy_name": "Trend Following (EMA pullback)",
-        "ui_timeframe": "1h",
-        "ui_min_score": 60.0,
-        "ui_w_trend": 2.5,
-        "ui_w_strength": 1.5,
-        "ui_w_pullback": 1.5,
-        "ui_w_rsi": 1.0,
-        "ui_atr_mult": 2.8,
-        "ui_rr": 2.0,
-        "ui_chart_style": "Candles",
-    },
-    "Momentum (more signals)": {
-        "ui_strategy_name": "Momentum (ROC+VOL+RSI)",
-        "ui_timeframe": "15m",
-        "ui_momo_thr": 0.25,
-        "ui_min_score": 52.0,
-        "ui_w_roc": 2.5,
-        "ui_w_vol": 2.0,
-        "ui_w_rsi": 1.0,
-        "ui_atr_mult": 2.3,
-        "ui_rr": 1.8,
-        "ui_chart_style": "Close line (fast)",
-    },
-    "Mean reversion (RSI)": {
-        "ui_strategy_name": "RSI Mean Reversion",
-        "ui_timeframe": "15m",
-        "ui_min_score": 50.0,
-        "ui_w_rsi": 2.5,
-        "ui_w_vol": 1.0,
-        "ui_w_trend": 0.5,
-        "ui_atr_mult": 2.2,
-        "ui_rr": 1.5,
-        "ui_exit_override": "Time Stop",
-        "ui_time_stop_bars": 48,
-        "ui_chart_style": "Candles",
-    },
-}
-
-# Default template (overridden by sidebar theme)
-plotly_template = "plotly_dark"
-
+st.title("BTC Strategy Trade Visualiser (v4.9) — beginner help + strategies + scoring + walk-forward ML")
 
 with st.sidebar:
-    st.header("Controls")
+    st.header("Upload Data")
+    files = st.file_uploader("Binance BTCUSDT ZIP / CSV", type=["zip", "csv"], accept_multiple_files=True)
 
-    # ---- Appearance / UX ----
-    with st.expander("🎨 Appearance & layout", expanded=False):
-        theme_mode = st.selectbox("Theme", ["Dark", "Light"], index=0, key="ui_theme_mode", help="App UI theme (CSS + Plotly template).")
-        accent_hex = st.color_picker("Accent color", "#00D1B2", key="ui_accent_hex")
-        plotly_template = apply_ui_theme(theme_mode, accent_hex)
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("Clear cache"):
+            st.cache_data.clear()
+            st.rerun()
+    with colB:
+        st.write("")
 
-        compact_sidebar = st.toggle("Compact sidebar (use dropdown sections)", True)
-        beginner_mode = st.toggle("Beginner mode (extra hints)", True)
-        show_inline_help = st.toggle("Show inline parameter explanations", False, help="Turn ON for long per-parameter explainers (adds scrolling).")
+    st.divider()
+    beginner_mode = st.toggle("Beginner mode (show explanations)", True, help="Turn ON to see plain-English help and what each slider changes.")
 
-
-    # ---- Presets / save / load ----
-    with st.expander("💾 Presets & save/load", expanded=False):
-        preset_names = ["(none)"] + list(PRESETS.keys())
-        preset_pick = st.selectbox("Preset", preset_names, index=0, help="Apply a tested bundle of settings quickly.")
-        colp1, colp2 = st.columns(2)
-        with colp1:
-            if st.button("Apply preset", use_container_width=True, disabled=(preset_pick == "(none)")):
-                _apply_ui_settings(PRESETS.get(preset_pick, {}), only_known=True)
-                st.rerun()
-        with colp2:
-            st.download_button(
-                "Download settings JSON",
-                data=json.dumps(_collect_ui_settings(), indent=2, ensure_ascii=False).encode("utf-8"),
-                file_name="btc_visualiser_settings.json",
-                mime="application/json",
-                use_container_width=True,
-            )
-
-        up = st.file_uploader("Load settings JSON", type=["json"], help="Upload a settings JSON previously downloaded here.")
-        if up is not None:
-            try:
-                loaded = json.loads(up.getvalue().decode("utf-8"))
-                _apply_ui_settings(loaded, only_known=True)
-                st.success("Settings loaded.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Could not load JSON: {e}")
-
-    # ---- Quick controls (favorites + search) ----
-    with st.expander("⭐ Quick controls (favorites + search)", expanded=False):
-        PARAM_DEFS = {
-            "Min score": ("slider", "ui_min_score", dict(min_value=0.0, max_value=100.0, value=55.0, step=1.0)),
-            "ATR mult": ("number", "ui_atr_mult", dict(min_value=0.5, max_value=10.0, value=2.5, step=0.1)),
-            "RR": ("number", "ui_rr", dict(min_value=0.5, max_value=10.0, value=2.0, step=0.1)),
-            "Fast SMA": ("number", "ui_fast", dict(min_value=2, max_value=500, value=10, step=1)),
-            "Slow SMA": ("number", "ui_slow", dict(min_value=3, max_value=1000, value=20, step=1)),
-            "Trend SMA": ("number", "ui_trend_len", dict(min_value=10, max_value=2000, value=200, step=5)),
-            "Risk $ (fixed)": ("number", "ui_risk", dict(min_value=1.0, max_value=1_000_000.0, value=100.0, step=10.0)),
-            "Risk % (equity)": ("number", "ui_risk_pct", dict(min_value=0.01, max_value=50.0, value=1.0, step=0.05)),
-            "Leverage cap": ("number", "ui_leverage_cap", dict(min_value=1.0, max_value=200.0, value=10.0, step=1.0)),
-            "Chart last N candles": ("number", "ui_chart_last_n", dict(min_value=300, max_value=100000, value=3500, step=100)),
-        }
-
-        fav_default = ["Min score", "ATR mult", "RR", "Chart last N candles"]
-        favs = st.multiselect("Favorites", list(PARAM_DEFS.keys()), default=fav_default)
-
-        q_search = st.text_input("Search settings (name contains...)")
-        show_list = list(dict.fromkeys(favs + ([k for k in PARAM_DEFS.keys() if q_search and q_search.lower() in k.lower()])))
-
-        if not show_list:
-            st.caption("Pick favorites or search a parameter name to show quick controls.")
-        else:
-            for name in show_list:
-                typ, master_key, cfg = PARAM_DEFS[name]
-                # Ensure master exists so value(...) reads correctly
-                if master_key not in st.session_state:
-                    st.session_state[master_key] = cfg.get("value")
-                cur = st.session_state.get(master_key, cfg.get("value"))
-                k2 = f"qc_{master_key}"
-
-                if typ == "slider":
-                    val = st.slider(name, cfg["min_value"], cfg["max_value"], float(cur), float(cfg["step"]), key=k2)
-                elif typ == "number":
-                    # choose int vs float
-                    if isinstance(cfg["min_value"], int) and isinstance(cfg["max_value"], int) and isinstance(cfg.get("step", 1), int):
-                        val = st.number_input(name, int(cfg["min_value"]), int(cfg["max_value"]), int(cur), step=int(cfg.get("step", 1)), key=k2)
-                    else:
-                        val = st.number_input(name, float(cfg["min_value"]), float(cfg["max_value"]), float(cur), step=float(cfg.get("step", 0.1)), key=k2)
-                else:
-                    continue
-
-                # Push back into master state (next rerun the main widget will reflect it)
-                st.session_state[master_key] = val
-
-    # ---- Data ----
-    with st.expander("📁 Data upload", expanded=True):
-        files = st.file_uploader("Binance BTCUSDT ZIP / CSV", type=["zip", "csv"], accept_multiple_files=True)
-        colA, colB = st.columns(2)
-        with colA:
-            if st.button("Clear cache"):
-                st.cache_data.clear()
-                st.rerun()
-        with colB:
-            if st.button("Reset UI"):
-                for k in list(st.session_state.keys()):
-                    if k.startswith("ui_") or k in {"has_run"}:
-                        st.session_state.pop(k, None)
-                st.rerun()
-
-    # ---- Help / glossary ----
-    with st.expander("📚 Help / glossary", expanded=False):
-        st.markdown('''
+    st.divider()
+    st.header("Help / Glossary")
+    with st.expander("What do these settings mean? (click to expand)", expanded=False):
+        st.markdown(
+            """
 **Core indicators**
 - **SMA (Simple Moving Average):** Average of the last N closes. Smooths noise.
 - **EMA (Exponential Moving Average):** Like SMA but reacts faster to new prices.
@@ -1526,184 +957,409 @@ with st.sidebar:
 - **Score:** Weighted average (0–100) of conditions (trend, RSI, volume, etc).
 - **Min score:** Only take trades where score ≥ this threshold.
 - **Weights:** How important each condition is for the score.
-''')
 
-    # ---- Timeframe ----
-    with st.expander("⏱️ Timeframe", expanded=True if compact_sidebar else True):
-        tf_label_to_rule = {"1m": "1T", "5m": "5T", "10m": "10T", "15m": "15T", "1h": "1H", "4h": "4H"}
-        timeframe = st.selectbox(
-            "Backtest timeframe",
-            list(tf_label_to_rule.keys()),
-            index=3,
-            key="ui_timeframe",
-            help="This changes BOTH the backtest timeframe and the default chart timeframe."
+**Sessions (UTC overlays)**
+- **Asia / London / NY boxes:** Helps see if a strategy works better in certain time windows.
+"""
         )
-
-    # ---- Strategy ----
-    with st.expander("🧠 Strategy", expanded=True if compact_sidebar else True):
-        strategy_name = st.selectbox("Choose strategy", STRATEGIES, index=0, key="ui_strategy_name")
-
-        if beginner_mode:
-            STRAT_EXPLAIN = {
-                "MA Crossover": "Buys when fast SMA crosses above slow SMA; shorts on opposite. Best in trends.",
-                "Momentum (ROC+VOL+RSI)": "Trades when price accelerates (ROC) with volume expansion and RSI confirmation.",
-                "Trend Following (EMA pullback)": "Trades in trend direction after pullback; exits on trend flip.",
-                "Range Breakout": "Trades breakout beyond recent range boundary.",
-                "Bollinger Squeeze Breakout": "Trades volatility expansion after tight Bollinger Bands.",
-                "RSI Mean Reversion": "Buys oversold / sells overbought aiming for snap-back.",
-                "VWAP Reversion": "Trades when price deviates from VWAP expecting reversion to fair value.",
-                "Liquidity Sweep (basic)": "Stop-hunt above/below equal highs/lows and trades the reversal.",
-            }
-            st.caption(STRAT_EXPLAIN.get(strategy_name, ""))
-
-        st.markdown("**Core params**")
-        fast = st.number_input("Fast SMA", 2, 500, 10, key="ui_fast")
-        slow = st.number_input("Slow SMA", 3, 1000, 20, key="ui_slow")
-        trend_len = st.number_input("Trend SMA", 10, 2000, 200, key="ui_trend_len")
-
-        st.markdown("**Strategy params**")
-        rsi_len = st.number_input("RSI Length", 2, 100, 14, key="ui_rsi_len")
-        roc_len = st.number_input("ROC Length", 2, 200, 20, key="ui_roc_len")
-        momentum_roc_thresh = st.number_input("Momentum ROC threshold (%)", 0.05, 5.0, 0.25, 0.05, key="ui_momo_thr")
-        vol_len = st.number_input("Volume MA Length", 2, 500, 20, key="ui_vol_len")
-        range_len = st.number_input("Range lookback", 5, 500, 50, key="ui_range_len")
-        break_close = st.toggle("Range breakout requires CLOSE outside", True, key="ui_break_close")
-
-        bb_len = st.number_input("BB Length", 5, 300, 20, key="ui_bb_len")
-        bb_k = st.number_input("BB StdDev", 1.0, 4.0, 2.0, 0.25, key="ui_bb_k")
-        squeeze_pct = st.number_input("Squeeze threshold (BB width %)", 0.1, 20.0, 2.0, 0.1, key="ui_sqz")
-
-        use_session_vwap = st.toggle("VWAP: session reset (daily)", True, key="ui_vwap_session")
-        vwap_dev = st.number_input("VWAP deviation trigger (%)", 0.1, 10.0, 1.0, 0.1, key="ui_vwap_dev")
-
-        if show_inline_help and beginner_mode:
-            st.info("Tip: Change ONE parameter at a time and re-test. Start with timeframe + date range first.")
-
-    # ---- Confluence scoring ----
-    with st.expander("🧩 Confluence scoring", expanded=False if compact_sidebar else True):
-        min_score = st.slider("Min score to take trade", 0.0, 100.0, 55.0, 1.0, key="ui_min_score")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            w_trend = st.slider("Weight: Trend", 0.0, 5.0, 2.0, 0.5, key="ui_w_trend")
-            w_rsi = st.slider("Weight: RSI", 0.0, 5.0, 1.5, 0.5, key="ui_w_rsi")
-            w_vol = st.slider("Weight: Volume", 0.0, 5.0, 1.5, 0.5, key="ui_w_vol")
-            w_strength = st.slider("Weight: Strength", 0.0, 5.0, 1.5, 0.5, key="ui_w_strength")
-        with col2:
-            w_compression = st.slider("Weight: Compression", 0.0, 5.0, 1.0, 0.5, key="ui_w_compress")
-            w_pullback = st.slider("Weight: Pullback", 0.0, 5.0, 1.0, 0.5, key="ui_w_pullback")
-            w_roc = st.slider("Weight: ROC", 0.0, 5.0, 2.0, 0.5, key="ui_w_roc")
-            w_wick = st.slider("Weight: Wick/Rejection", 0.0, 5.0, 1.0, 0.5, key="ui_w_wick")
-            w_dev = st.slider("Weight: Deviation", 0.0, 5.0, 2.0, 0.5, key="ui_w_dev")
-
-        weights = {
-            "trend": w_trend,
-            "rsi": w_rsi,
-            "vol": w_vol,
-            "strength": w_strength,
-            "compression": w_compression,
-            "pullback": w_pullback,
-            "roc": w_roc,
-            "wick": w_wick,
-            "dev": w_dev,
-            "ma_sep": w_strength,
-            "reclaim": w_strength,
-        }
-
-    # ---- Risk / execution ----
-    
-    # ---- Risk / execution ----
-    with st.expander("🛡️ Risk & execution", expanded=False if compact_sidebar else True):
-        atr_len = st.number_input("ATR Length", 2, 100, 14, key="ui_atr_len")
-        atr_mult = st.number_input("ATR Multiplier", 0.5, 10.0, 2.5, key="ui_atr_mult")
-        rr = st.number_input("Risk Reward (RR)", 0.5, 10.0, 2.0, key="ui_rr")
-
-        st.markdown("**Position sizing**")
-        sizing_mode = st.selectbox(
-            "Sizing mode",
-            ["Fixed $ risk", "% of equity"],
-            index=0,
-            key="ui_sizing_mode",
-            help="Fixed $ matches your old behaviour. % of equity compounds if enabled.",
-        )
-        start_balance = st.number_input("Starting balance ($)", 10.0, 1_000_000_000.0, 10_000.0, step=100.0, key="ui_start_balance")
-        compound = st.toggle("Compound equity (size uses current balance)", True, key="ui_compound")
-
-        if sizing_mode.startswith("Fixed"):
-            risk = st.number_input("Risk per trade ($)", 1.0, 1_000_000.0, 100.0, key="ui_risk")
-            risk_pct = st.number_input("Risk % per trade (info)", 0.01, 50.0, 1.0, step=0.05, key="ui_risk_pct", disabled=True)
-        else:
-            risk_pct = st.number_input("Risk % per trade", 0.01, 50.0, 1.0, step=0.05, key="ui_risk_pct")
-            # keep a placeholder for compatibility; backtest sizes each trade from % equity
-            risk = st.number_input("Risk per trade ($) (derived)", 1.0, 1_000_000.0, 100.0, key="ui_risk", disabled=True)
-
-        leverage_cap = st.number_input("Leverage cap (x)", 1.0, 200.0, 10.0, step=1.0, key="ui_leverage_cap")
-        min_pos_usd = st.number_input("Min position notional ($)", 0.0, 1_000_000_000.0, 0.0, step=10.0, key="ui_min_pos_usd")
-        max_pos_usd = st.number_input("Max position notional ($)", 0.0, 1_000_000_000_000.0, 1_000_000.0, step=100.0, key="ui_max_pos_usd")
-        if max_pos_usd > 0 and min_pos_usd > max_pos_usd:
-            st.warning("Min notional is greater than max notional. Adjusting min down to max.")
-            min_pos_usd = max_pos_usd
-            st.session_state["ui_min_pos_usd"] = float(min_pos_usd)
-
-        st.markdown("**Execution**")
-        both_dirs = st.toggle("Trade Long & Short", True, key="ui_both_dirs")
-        exit_on_opp = st.toggle("Exit on opposite signal (extra)", False, key="ui_exit_on_opp")
-
-        fill_next_open = st.toggle("Enter on next candle OPEN (realistic)", True, key="ui_fill_next_open")
-        intrabar_rule = st.selectbox(
-            "If TP & SL hit same candle",
-            ["Worst case (SL first)", "Best case (TP first)"],
-            index=0,
-            key="ui_intrabar_rule",
-        )
-
-
-    # ---- Exit model ----
-    with st.expander("🚪 Exit model", expanded=False if compact_sidebar else True):
-        exit_override = st.selectbox("Exit model", EXIT_MODELS, index=0, key="ui_exit_override")
-        trail_atr_mult = st.number_input("Trailing ATR multiple", 0.5, 10.0, 2.0, 0.25, key="ui_trail_atr_mult")
-        time_stop_bars = st.number_input("Time stop (bars)", 5, 5000, 48, key="ui_time_stop_bars")
-
-    # ---- ML ----
-    with st.expander("🤖 ML probability filter", expanded=False):
-        use_ml = st.toggle("Enable ML filter (P(win) per signal)", False, key="ui_use_ml")
-        ml_mode = st.selectbox("ML mode", ["Single-split (fast)", "Walk-forward (realistic)"], index=1, key="ui_ml_mode")
-        train_frac = st.slider("Single-split training fraction", 0.3, 0.9, 0.7, key="ui_train_frac")
-        wf_train_bars = st.number_input("Walk-forward train bars", 200, 20000, 3000, key="ui_wf_train_bars")
-        wf_test_bars = st.number_input("Walk-forward test bars", 50, 5000, 500, key="ui_wf_test_bars")
-        proba_thresh = st.slider("Only take trades if P(win) ≥", 0.50, 0.80, 0.55, 0.01, key="ui_proba_thresh")
-
-    # ---- Chart options (performance matters) ----
-    with st.expander("📈 Chart options (reduce lag)", expanded=False):
-        chart_height = st.slider("Chart height", 520, 980, 720, 20, key="ui_chart_height")
-        chart_window_mode = st.selectbox("Chart window", ["Last N candles (fast)", "Full backtest range (slower)"], index=0, key="ui_chart_window")
-        chart_last_n = st.number_input("Last N candles", 300, 100000, 3500, step=100, key="ui_chart_last_n")
-        chart_max_candles = st.number_input("Hard cap candles (safety)", 500, 200000, 12000, step=500, key="ui_chart_cap")
-
-        chart_style = st.selectbox("Chart style", ["Candles", "Heikin Ashi", "OHLC", "Close line (fast)", "Close area (fast)"], index=0, key="ui_chart_style")
-
-        show_indicators = st.toggle("Show indicator lines", True, key="ui_show_indicators")
-        show_ml_overlay = st.toggle("Show ML P(win) markers", True, key="ui_show_ml_overlay")
-
-        marker_mode = st.selectbox(
-            "Trade markers",
-            ["Selected trade only (fast)", "All trades (can lag)", "Off"],
-            index=0,
-            key="ui_marker_mode",
-        )
-        marker_limit = st.number_input("If 'All trades': cap markers to last N trades", 50, 20000, 2000, step=50, key="ui_marker_limit")
-        show_selected_sl_tp = st.toggle("Show SL/TP for selected trade", True, key="ui_show_sl_tp")
-
-        st.markdown("**Sessions (UTC overlays)**")
-        show_sessions = st.toggle("Show session overlays", True, key="ui_show_sessions")
-        show_asia = st.toggle("Asia (00–06)", True, key="ui_show_asia")
-        show_london = st.toggle("London (07–10)", True, key="ui_show_london")
-        show_ny = st.toggle("NY (13–16)", True, key="ui_show_ny")
-        session_max_days = st.number_input("Auto-disable overlays if days >", 30, 3650, 180, step=30, key="ui_session_max_days")
-        force_sessions = st.toggle("Force overlays even if slow", False, key="ui_force_sessions")
 
     st.divider()
-    run_now = st.button("Run backtest", use_container_width=True)
+    st.header("Timeframe")
+    tf_label_to_rule = {"1m": "1T", "5m": "5T", "10m": "10T", "15m": "15T", "1h": "1H", "4h": "4H"}
+    timeframe = st.selectbox("Chart/Backtest timeframe", list(tf_label_to_rule.keys()), index=3,
+                             help="This changes BOTH the chart and the backtest timeframe.")
+
+    st.divider()
+    st.header("Strategy Engine")
+    strategy_name = st.selectbox(
+        "Choose strategy",
+        STRATEGIES,
+        index=0,
+        help="Pick which strategy generates entry signals. Exits are configured below."
+    )
+
+    if beginner_mode:
+        STRAT_EXPLAIN = {
+            "MA Crossover": "Buys when fast SMA crosses above slow SMA, sells/shorts on opposite. Best in trends; sideways chop hurts it.",
+            "Momentum (ROC+VOL+RSI)": "Trades when price is moving fast (ROC), volume expands, and RSI confirms momentum.",
+            "Trend Following (EMA pullback)": "Trades in trend direction after price pulls back to EMA area; exits on trend flip.",
+            "Range Breakout": "Finds a tight range and trades the breakout beyond the range boundary.",
+            "Bollinger Squeeze Breakout": "Trades volatility expansion after a ‘squeeze’ (very tight Bollinger Bands).",
+            "RSI Mean Reversion": "Buys oversold and sells overbought aiming for a snap-back to normal.",
+            "VWAP Reversion": "Trades when price is far from VWAP expecting it to revert toward ‘fair price’.",
+            "Liquidity Sweep (basic)": "Looks for stop-hunts above/below recent equal highs/lows and trades the reversal.",
+        }
+        st.info(f"**How this strategy works:** {STRAT_EXPLAIN.get(strategy_name,'')}")
+
+    # Strategy hints (quick defaults)
+    DEFAULTS_HINT = {
+        "MA Crossover": "Typical: Fast=10, Slow=20, Trend=200. Works better on higher TFs; chop hurts.",
+        "Momentum (ROC+VOL+RSI)": "Typical: ROC len 20, ROC thr 0.25–0.60, RSI 14, Vol MA 20.",
+        "Trend Following (EMA pullback)": "EMA20/EMA50 used internally. RSI filter mild (55/45).",
+        "Range Breakout": "Range lookback 30–80. Require close outside for cleaner signals.",
+        "Bollinger Squeeze Breakout": "BB len 20, k=2.0, squeeze width 1–3%.",
+        "RSI Mean Reversion": "RSI 14. Time stop helps avoid trades that never revert.",
+        "VWAP Reversion": "Daily VWAP on. Dev 0.7–2.0%.",
+        "Liquidity Sweep (basic)": "Best near equal highs/lows. Combine with higher TF trend bias.",
+    }
+    st.caption(f"**Strategy note:** {DEFAULTS_HINT.get(strategy_name,'')}")
+
+    st.subheader("Core Params (some strategies)")
+    fast = st.number_input("Fast SMA", 2, 500, 10, help="Short-term average price. Controls how quickly signals react.")
+    if beginner_mode:
+        explain(
+            "Fast SMA",
+            "A smooth line of the last N closes. It represents short-term direction.",
+            "Signals react slower; fewer trades; usually cleaner but later entries.",
+            "Signals react faster; more trades; earlier entries but more false signals."
+        )
+
+    slow = st.number_input("Slow SMA", 3, 1000, 20, help="Longer-term average price. Used as the trend reference for crossover.")
+    if beginner_mode:
+        explain(
+            "Slow SMA",
+            "A slower moving average. When fast crosses it, that’s the main crossover signal.",
+            "Fewer signals; stronger trend confirmation; later entries.",
+            "More signals; faster flips; can get chopped in sideways markets."
+        )
+
+    trend_len = st.number_input("Trend SMA", 10, 2000, 200, help="Big trend filter baseline. Used by some strategies to avoid countertrend trades.")
+    if beginner_mode:
+        explain(
+            "Trend SMA",
+            "A big 'market bias' line. Often: take longs above it and shorts below it.",
+            "More long-term bias; filters out more countertrend trades; fewer trades.",
+            "Less strict bias; more trades; more chance of trading against the bigger move."
+        )
+
+    st.subheader("Strategy Params")
+    rsi_len = st.number_input("RSI Length", 2, 100, 14, help="RSI lookback candles. 14 is common.")
+    if beginner_mode:
+        explain(
+            "RSI Length",
+            "RSI measures momentum (how strong recent moves are).",
+            "RSI is smoother; fewer signals; less noise.",
+            "RSI is twitchier; more signals; more fakeouts."
+        )
+
+    roc_len = st.number_input("ROC Length", 2, 200, 20, help="ROC lookback candles. Measures % change over N candles.")
+    if beginner_mode:
+        explain(
+            "ROC Length",
+            "ROC measures speed: % change over the last N candles.",
+            "ROC becomes slower; only sustained moves trigger (fewer momentum trades).",
+            "ROC becomes faster; catches bursts earlier but triggers more often."
+        )
+
+    momentum_roc_thresh = st.number_input(
+        "Momentum ROC threshold (%)", 0.05, 5.0, 0.25, 0.05,
+        help="Minimum ROC speed needed to classify as momentum."
+    )
+    if beginner_mode:
+        explain(
+            "Momentum ROC threshold",
+            "How strong the price move must be to count as momentum.",
+            "Fewer trades; when it triggers the move is usually stronger.",
+            "More trades; includes weaker moves; more false momentum."
+        )
+
+    vol_len = st.number_input("Volume MA Length", 2, 500, 20, help="Volume average length. Used to detect volume expansion.")
+    if beginner_mode:
+        explain(
+            "Volume MA Length",
+            "Baseline volume level. 'Volume expansion' means volume is high vs this average.",
+            "More stable volume baseline; fewer 'volume spike' detections.",
+            "More sensitive; more spikes detected; can be noisier on low-volume periods."
+        )
+
+    range_len = st.number_input("Range lookback", 5, 500, 50, help="How many candles define the range for breakouts.")
+    if beginner_mode:
+        explain(
+            "Range lookback",
+            "Defines the box (range). Breakout happens when price exits it.",
+            "Bigger range = fewer breakouts; stronger levels; slower to update.",
+            "Smaller range = more breakouts; weaker levels; more noise."
+        )
+
+    break_close = st.toggle("Range breakout requires CLOSE outside", True, help="ON = safer but later. OFF = earlier but noisier.")
+    if beginner_mode:
+        explain(
+            "Close outside (breakout)",
+            "Whether breakout must be confirmed by candle close beyond the range.",
+            "Cleaner signals; fewer fakeouts; entries are later.",
+            "Earlier entries; more signals; higher fakeout risk."
+        )
+
+    bb_len = st.number_input("BB Length", 5, 300, 20, help="Bollinger band length (usually 20).")
+    if beginner_mode:
+        explain(
+            "BB Length",
+            "How far back Bollinger Bands look to estimate normal price movement.",
+            "Smoother bands; fewer squeezes; slower reactions.",
+            "More reactive bands; more squeezes; more signals but noisier."
+        )
+
+    bb_k = st.number_input("BB StdDev", 1.0, 4.0, 2.0, 0.25, help="Band width multiplier. 2.0 is common.")
+    if beginner_mode:
+        explain(
+            "BB StdDev (K)",
+            "How wide bands are around the average.",
+            "Wider bands: fewer breakouts; signals require stronger moves.",
+            "Narrower bands: more breakouts; more frequent but weaker signals."
+        )
+
+    squeeze_pct = st.number_input(
+        "Squeeze threshold (BB width %)", 0.1, 20.0, 2.0, 0.1,
+        help="When BB width % is below this, market is 'compressed'."
+    )
+    if beginner_mode:
+        explain(
+            "Squeeze threshold",
+            "Defines what counts as 'low volatility'. Lower means stricter.",
+            "Stricter squeeze: fewer setups, often better quality.",
+            "Looser squeeze: more setups, but includes less meaningful compression."
+        )
+
+    use_session_vwap = st.toggle("VWAP: session reset (daily)", True, help="ON = VWAP resets each day. OFF = anchored across whole range.")
+    if beginner_mode:
+        explain(
+            "VWAP daily reset",
+            "Whether VWAP restarts each day (common) or stays anchored from the start of your dataset.",
+            "Daily VWAP: clearer intraday mean; better for day-style reversion logic.",
+            "Anchored VWAP: tracks long-period 'fair value'; slower mean reversion signals."
+        )
+
+    vwap_dev = st.number_input("VWAP deviation trigger (%)", 0.1, 10.0, 1.0, 0.1, help="How far from VWAP before you consider it 'stretched'.")
+    if beginner_mode:
+        explain(
+            "VWAP deviation trigger",
+            "How far price must be from VWAP before you take a mean reversion signal.",
+            "Fewer trades; only very stretched moves; often higher win rate but fewer opportunities.",
+            "More trades; smaller deviations; can get run over in strong trends."
+        )
+
+    st.divider()
+    st.header("Confluence Scoring")
+    st.caption("Signals only taken if score ≥ min score. Score = weighted average of components.")
+
+    min_score = st.slider("Min score to take trade", 0.0, 100.0, 55.0, 1.0, help="Only take signals if score is high enough.")
+    if beginner_mode:
+        explain(
+            "Min score",
+            "This is your 'quality bar'. A trade only happens if conditions line up strongly enough.",
+            "Fewer trades; higher average quality; may miss some moves.",
+            "More trades; lower average quality; more noise/loss streaks."
+        )
+
+    # weights
+    w_trend = st.slider("Weight: Trend", 0.0, 5.0, 2.0, 0.5, help="How much trend alignment matters in the score.")
+    if beginner_mode:
+        explain(
+            "Weight: Trend",
+            "How much the score cares about trading with the bigger direction.",
+            "Score becomes more trend-focused (filters countertrend trades).",
+            "Trend matters less (more countertrend/mixed trades)."
+        )
+
+    w_rsi = st.slider("Weight: RSI", 0.0, 5.0, 1.5, 0.5, help="How much RSI contributes to the score.")
+    if beginner_mode:
+        explain(
+            "Weight: RSI",
+            "How much momentum / overbought-oversold condition impacts trade quality.",
+            "Signals become more RSI-driven; fewer trades if RSI isn't confirming.",
+            "RSI matters less; strategy relies more on other conditions."
+        )
+
+    w_vol = st.slider("Weight: Volume", 0.0, 5.0, 1.5, 0.5, help="How much volume expansion/exhaustion matters.")
+    if beginner_mode:
+        explain(
+            "Weight: Volume",
+            "How much you require volume to 'support' the move.",
+            "Fewer trades; stronger moves preferred; filters low-volume noise.",
+            "More trades; volume confirmation is less important."
+        )
+
+    w_strength = st.slider("Weight: Strength/Distance", 0.0, 5.0, 1.5, 0.5, help="Break strength / MA separation / distance-from-level.")
+    if beginner_mode:
+        explain(
+            "Weight: Strength/Distance",
+            "How much you reward 'decisive movement' away from key levels.",
+            "Trades require stronger breaks / more separation; fewer but often cleaner.",
+            "Allows weaker breaks; more trades; more fakeouts."
+        )
+
+    w_compression = st.slider("Weight: Compression", 0.0, 5.0, 1.0, 0.5, help="How much low-volatility compression matters.")
+    if beginner_mode:
+        explain(
+            "Weight: Compression",
+            "Rewards setups after quiet periods (ranges/squeezes).",
+            "Favors squeeze/range setups; fewer trades but often better expansions.",
+            "Compression matters less; strategy can trigger in messy conditions."
+        )
+
+    w_pullback = st.slider("Weight: Pullback", 0.0, 5.0, 1.0, 0.5, help="How much pullback quality matters (trend strategies).")
+    if beginner_mode:
+        explain(
+            "Weight: Pullback",
+            "Rewards price returning to a 'value area' before continuing the trend.",
+            "More patient entries; fewer trades; can improve win rate.",
+            "More aggressive entries; more trades; can enter too early."
+        )
+
+    w_roc = st.slider("Weight: ROC", 0.0, 5.0, 2.0, 0.5, help="How much speed (ROC) matters in momentum strategies.")
+    if beginner_mode:
+        explain(
+            "Weight: ROC",
+            "How much you care about 'speed' of price movement.",
+            "More momentum-only trades; fewer but stronger moves.",
+            "Less emphasis on speed; more trades even when movement is mild."
+        )
+
+    w_wick = st.slider("Weight: Wick/Rejection", 0.0, 5.0, 1.0, 0.5, help="How much wick rejection matters (liquidity sweeps).")
+    if beginner_mode:
+        explain(
+            "Weight: Wick/Rejection",
+            "Rewards long wicks / rejections that suggest a stop-hunt reversal.",
+            "Fewer sweep trades; only strong rejection candles count.",
+            "More sweep trades; weaker rejection allowed."
+        )
+
+    w_dev = st.slider("Weight: Deviation", 0.0, 5.0, 2.0, 0.5, help="How much distance-from-mean matters (VWAP/mean reversion).")
+    if beginner_mode:
+        explain(
+            "Weight: Deviation",
+            "Rewards price being far from the mean (VWAP/bands) before taking reversion trades.",
+            "Waits for bigger stretch; fewer trades; often safer reversion attempts.",
+            "More trades on small stretches; higher risk of trend continuation."
+        )
+
+    weights = {
+        "trend": w_trend,
+        "rsi": w_rsi,
+        "vol": w_vol,
+        "strength": w_strength,
+        "compression": w_compression,
+        "pullback": w_pullback,
+        "roc": w_roc,
+        "wick": w_wick,
+        "dev": w_dev,
+        "ma_sep": w_strength,
+        "reclaim": w_strength,
+    }
+
+    st.divider()
+    st.header("Risk / Execution")
+    atr_len = st.number_input("ATR Length", 2, 100, 14, help="ATR lookback candles. Measures typical movement (volatility).")
+    if beginner_mode:
+        explain(
+            "ATR Length",
+            "How many candles ATR uses to estimate typical candle movement.",
+            "Smoother ATR; stops adapt slower; less jumpy.",
+            "Faster ATR response; stops adapt quicker to changing volatility."
+        )
+
+    atr_mult = st.number_input("ATR Multiplier", 0.5, 10.0, 2.5, help="Stop distance = ATR × multiplier.")
+    if beginner_mode:
+        explain(
+            "ATR Multiplier",
+            "Sets how wide the stop is based on volatility.",
+            "Wider stops: fewer stop-outs; but you tolerate bigger move against you.",
+            "Tighter stops: better R:R potential; more stop-outs."
+        )
+
+    rr = st.number_input("Risk Reward (RR)", 0.5, 10.0, 2.0, help="TP distance compared to stop distance (RR=2 aims for 2R).")
+    if beginner_mode:
+        explain(
+            "Risk Reward (RR)",
+            "How far the take-profit is relative to the stop distance.",
+            "Bigger winners but fewer reach TP (win rate often drops).",
+            "More TPs hit but smaller wins (needs higher win rate)."
+        )
+
+    risk = st.number_input("Risk per trade ($)", 1.0, 1_000_000.0, 100.0, help="Fixed $ loss if SL is hit (backtest uses this).")
+    if beginner_mode:
+        explain(
+            "Risk per trade ($)",
+            "Backtest assumes you lose this amount when SL hits (like risking $100 each trade).",
+            "PnL swings bigger (more volatility).",
+            "PnL swings smaller (more stable)."
+        )
+
+    both_dirs = st.toggle("Trade Long & Short", True, help="ON = allows both longs and shorts. OFF = longs only.")
+    exit_on_opp = st.toggle("Exit on opposite signal (extra)", False, help="If ON, also exits when opposite signal happens (in addition to exit model).")
+
+    fill_next_open = st.toggle("Enter on next candle OPEN (more realistic)", True, help="Signal is confirmed at close; fill happens next candle open.")
+    if beginner_mode:
+        explain(
+            "Enter next candle open",
+            "Prevents 'perfect fills' inside the signal candle. More realistic execution.",
+            "More realistic; often slightly worse entries; less inflated results.",
+            "More optimistic; can look better than real trading."
+        )
+
+    intrabar_rule = st.selectbox(
+        "If TP & SL hit same candle",
+        ["Worst case (SL first)", "Best case (TP first)"],
+        index=0,
+        help="Candles don’t show the internal path. Choose conservative or optimistic assumption."
+    )
+    if beginner_mode:
+        explain(
+            "TP/SL same candle",
+            "If both TP and SL are inside one candle, you don't know which happened first.",
+            "Worst-case is conservative realism (stress test).",
+            "Best-case is optimistic (use carefully)."
+        )
+
+    st.divider()
+    st.header("Exit Model")
+    exit_override = st.selectbox("Exit model", EXIT_MODELS, index=0, help="AUTO chooses a sensible exit per strategy; override to compare exits.")
+    trail_atr_mult = st.number_input("Trailing ATR multiple", 0.5, 10.0, 2.0, 0.25, help="Used by ATR Trailing Stop exit.")
+    time_stop_bars = st.number_input("Time stop (bars)", 5, 5000, 48, help="Used by Time Stop exit (closes after N candles).")
+
+    if beginner_mode:
+        st.caption("**Exit model quick guide:**")
+        st.caption("- **TP/SL only:** exit only when TP or SL hits.")
+        st.caption("- **ATR Trailing Stop:** moves stop behind price as it moves in your favor.")
+        st.caption("- **EMA Flip Exit:** exits when EMA20/EMA50 trend flips (trend-following style).")
+        st.caption("- **Time Stop:** exits after N candles (helps mean reversion strategies).")
+        st.caption("- **Opposite Signal:** exits when the strategy gives the opposite signal.")
+
+    st.divider()
+    st.header("ML Probability Filter")
+    use_ml = st.toggle("Enable ML filter (score each signal)", False, help="Adds a P(win) model and filters out low-probability signals.")
+    ml_mode = st.selectbox("ML mode", ["Single-split (fast)", "Walk-forward (realistic)"], index=1,
+                           help="Walk-forward trains on past windows and predicts forward windows (no leakage).")
+    train_frac = st.slider("Single-split training fraction", 0.3, 0.9, 0.7, help="Only used in Single-split mode.")
+    wf_train_bars = st.number_input("Walk-forward train bars", 200, 20000, 3000, help="How many candles ML learns from each training window.")
+    wf_test_bars = st.number_input("Walk-forward test bars", 50, 5000, 500, help="How many candles ML predicts forward each step.")
+    proba_thresh = st.slider("Only take trades if P(win) ≥", 0.50, 0.80, 0.55, 0.01, help="Minimum ML probability required to accept a signal.")
+
+    if beginner_mode:
+        explain(
+            "ML filter (P(win))",
+            "ML tries to learn patterns that tend to win vs lose. It DOES NOT predict price. It filters signals.",
+            "Higher threshold: fewer trades but higher average quality.",
+            "Lower threshold: more trades, but more low-quality signals pass."
+        )
+
+    st.divider()
+    st.header("Chart")
+    show_indicators = st.toggle("Show strategy indicator lines", True, help="Shows lines like SMA/EMA/BB/VWAP (when available).")
+    show_selected_sl_tp = st.toggle("Show SL/TP for selected trade", True)
+    show_ml_overlay = st.toggle("Show ML P(win) markers on signals", True)
+
+    st.subheader("Sessions (UTC overlays)")
+    show_sessions = st.toggle("Show session overlays", True, help="Draw Asia/London/NY boxes on the chart for each day.")
+    show_asia = st.toggle("Asia (00–06)", True)
+    show_london = st.toggle("London (07–10)", True)
+    show_ny = st.toggle("NY (13–16)", True)
+
+    st.divider()
+    st.header("Performance")
+    run_now = st.button("Run backtest")
+
+
 # =====================
 # MAIN FLOW
 # =====================
@@ -1775,6 +1431,16 @@ d_sig = compute_signals(
     roc_len=int(roc_len),
     vol_len=int(vol_len),
     range_len=int(range_len),
+
+# Sanity-check signals dataframe before running ML/backtest
+if d_sig is None or (not isinstance(d_sig, pd.DataFrame)) or d_sig.empty:
+    st.error(
+        "Signals dataframe is empty/invalid. This can happen if the timeframe/date range produces no candles, "
+        "or if you deployed an older file missing `return x` in compute_signals. "
+        "Try: (1) widen the date range, (2) switch timeframe to match your data, (3) click Clear cache, then reload."
+    )
+    st.stop()
+
     break_close=bool(break_close),
     bb_len=int(bb_len),
     bb_k=float(bb_k),
@@ -1882,15 +1548,7 @@ d_full, trades = run_backtest_cached(
     bool(use_ml),
     proba,
     float(proba_thresh),
-    str(sizing_mode),
-    float(start_balance),
-    float(risk_pct),
-    float(leverage_cap),
-    float(min_pos_usd),
-    float(max_pos_usd),
-    bool(compound),
 )
-
 
 wins = int((trades["pnl"] > 0).sum()) if not trades.empty else 0
 losses = int((trades["pnl"] < 0).sum()) if not trades.empty else 0
@@ -1900,366 +1558,146 @@ avg_r = float(trades["r_mult"].mean()) if (not trades.empty and "r_mult" in trad
 avg_p = float(trades["p_win"].mean()) if (not trades.empty and "p_win" in trades.columns) else np.nan
 avg_score = float(trades["score"].mean()) if (not trades.empty and "score" in trades.columns) else np.nan
 
-st.markdown('<div class="muted">Tip: Use the sidebar sections to collapse settings. The chart tab also has performance controls (last N candles, markers, sessions).</div>', unsafe_allow_html=True)
+c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
+c1.metric("Trades", len(trades))
+c2.metric("Win rate", f"{wr:.1f}%")
+c3.metric("Wins", wins)
+c4.metric("Losses", losses)
+c5.metric("Net PnL ($)", f"{net:.0f}")
+c6.metric("Avg R", f"{avg_r:.2f}")
+c7.metric("Avg P(win)", f"{avg_p:.2f}" if np.isfinite(avg_p) else "—")
+c8.metric("Avg Score", f"{avg_score:.1f}" if np.isfinite(avg_score) else "—")
 
-tab_overview, tab_chart, tab_trades, tab_drill = st.tabs(["📌 Overview", "🕯️ Chart", "📋 Trades", "🔍 Drilldown"])
+# trade selector
+selected_idx = None
+t = None
+if not trades.empty:
+    t = trades.reset_index(drop=True)
+    labels = [
+        f"#{i+1} {r.side} | {r.entry_time:%Y-%m-%d %H:%M} → {r.exit_time:%Y-%m-%d %H:%M} | {r.outcome} | "
+        f"Score {r.score:.0f} | P(win) {r.p_win:.2f} | R {r.r_mult:+.2f} | {r.sig_tag} | {r.exit_model}"
+        for i, r in t.iterrows()
+    ]
+    selected = st.selectbox("Select a trade to highlight", ["(none)"] + labels, index=0)
+    if selected != "(none)":
+        selected_idx = labels.index(selected)
 
-with tab_overview:
-    st.subheader("Summary")
-    c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
-    c1.metric("Trades", len(trades))
-    c2.metric("Win rate", f"{wr:.1f}%")
-    c3.metric("Wins", wins)
-    c4.metric("Losses", losses)
-    c5.metric("Net PnL ($)", f"{net:.0f}")
-    c6.metric("Avg R", f"{avg_r:.2f}")
-    c7.metric("Avg P(win)", f"{avg_p:.2f}" if np.isfinite(avg_p) else "—")
-    c8.metric("Avg Score", f"{avg_score:.1f}" if np.isfinite(avg_score) else "—")
+# chart
+d_chart = d_full.copy()
 
+fig = go.Figure()
+fig.add_trace(
+    go.Candlestick(
+        x=d_chart["dt"],
+        open=d_chart["open"],
+        high=d_chart["high"],
+        low=d_chart["low"],
+        close=d_chart["close"],
+        name=f"BTCUSDT ({timeframe})",
+    )
+)
 
-    if not trades.empty:
-        colm1, colm2, colm3, colm4, colm5 = st.columns(5)
-        with colm1:
-            st.metric("Trades", len(trades))
-        with colm2:
-            st.metric("Win rate", f"{(trades['pnl']>0).mean()*100:.1f}%")
-        with colm3:
-            st.metric("Avg R", f"{trades['r_mult'].mean():.2f}")
-        with colm4:
-            st.metric("Net PnL ($)", f"{trades['pnl'].sum():,.2f}")
-        with colm5:
-            start_bal = float(st.session_state.get("ui_start_balance", 10_000.0))
-            end_bal = float(trades["equity_after"].dropna().iloc[-1]) if ("equity_after" in trades.columns and trades["equity_after"].notna().any()) else float(start_bal + trades["pnl"].sum())
-            st.metric("End balance", f"{end_bal:,.2f}")
+if show_sessions:
+    fig = add_session_overlays(fig, d_chart["dt"], show_asia=show_asia, show_london=show_london, show_ny=show_ny)
 
-        # Build equity series (uses equity_after if available)
-        t = trades.sort_values("exit_time").copy()
-        start_bal = float(st.session_state.get("ui_start_balance", 10_000.0))
+if show_indicators:
+    for col_name, label in [
+        ("FAST", f"SMA {fast}"),
+        ("SLOW", f"SMA {slow}"),
+        ("TREND", f"SMA {trend_len}"),
+        ("EMA20", "EMA20"),
+        ("EMA50", "EMA50"),
+        ("BB_U", "BB Upper"),
+        ("BB_M", "BB Mid"),
+        ("BB_L", "BB Lower"),
+        ("VWAP", "VWAP"),
+        ("R_H", "Range High"),
+        ("R_L", "Range Low"),
+    ]:
+        if col_name in d_chart.columns:
+            fig.add_trace(go.Scatter(x=d_chart["dt"], y=d_chart[col_name], mode="lines", name=label))
 
-        if "equity_after" in t.columns and t["equity_after"].notna().any():
-            equity_series = pd.Series(t["equity_after"].astype(float).to_numpy(), index=t["exit_time"])
-        else:
-            equity_series = pd.Series((start_bal + t["pnl"].astype(float).cumsum()).to_numpy(), index=t["exit_time"])
-
-        eq_df = pd.DataFrame({"time": equity_series.index, "equity": equity_series.values})
-        eq_df["peak"] = eq_df["equity"].cummax()
-        eq_df["drawdown"] = eq_df["equity"] - eq_df["peak"]
-        eq_df["drawdown_pct"] = np.where(eq_df["peak"] > 0, (eq_df["drawdown"] / eq_df["peak"]) * 100.0, 0.0)
-
-        max_dd = float(eq_df["drawdown"].min()) if not eq_df.empty else 0.0
-        max_dd_pct = float(eq_df["drawdown_pct"].min()) if not eq_df.empty else 0.0
-
-        st.markdown("### Equity & drawdown")
-        fig_eq = go.Figure()
-        fig_eq.add_trace(go.Scattergl(x=eq_df["time"], y=eq_df["equity"], mode="lines", name="Equity"))
-        fig_eq.update_layout(height=280, template=plotly_template, margin=dict(l=10, r=10, t=40, b=10), title="Equity curve (balance)")
-        st.plotly_chart(fig_eq, use_container_width=True)
-
-        fig_dd = go.Figure()
-        fig_dd.add_trace(go.Scattergl(x=eq_df["time"], y=eq_df["drawdown"], mode="lines", name="Drawdown"))
-        fig_dd.update_layout(height=220, template=plotly_template, margin=dict(l=10, r=10, t=40, b=10), title="Drawdown ($ from peak)")
-        st.plotly_chart(fig_dd, use_container_width=True)
-
-        st.caption(f"Max drawdown: ${abs(max_dd):,.2f} ({max_dd_pct:.2f}%) from peak.")
-
-        st.markdown("### Monthly performance")
-        t["month"] = t["exit_time"].dt.to_period("M").dt.to_timestamp()
-        mdf = (
-            t.groupby("month")
-            .agg(pnl=("pnl", "sum"), trades=("pnl", "size"), wins=("pnl", lambda s: int((s > 0).sum())))
-            .reset_index()
+if t is not None and not t.empty:
+    fig.add_trace(
+        go.Scatter(
+            x=t["entry_time"],
+            y=t["entry_price"],
+            mode="markers",
+            name="Entries",
+            marker=dict(symbol="triangle-up", size=10),
         )
-        mdf["win_rate"] = np.where(mdf["trades"] > 0, (mdf["wins"] / mdf["trades"]) * 100.0, np.nan)
-        st.dataframe(mdf, use_container_width=True, hide_index=True)
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=t["exit_time"],
+            y=t["exit_price"],
+            mode="markers",
+            name="Exits",
+            marker=dict(symbol="x", size=10),
+        )
+    )
 
-        # Compact year x month table (PnL)
-        if not mdf.empty:
-            tmp = mdf.copy()
-            tmp["year"] = tmp["month"].dt.year
-            tmp["mon"] = tmp["month"].dt.month
-            pivot = tmp.pivot_table(index="year", columns="mon", values="pnl", aggfunc="sum").fillna(0.0)
-            pivot.columns = [calendar.month_abbr[int(c)] for c in pivot.columns]
-            st.dataframe(pivot, use_container_width=True)
+if selected_idx is not None and t is not None:
+    r = t.iloc[selected_idx]
+    fig.add_trace(
+        go.Scatter(
+            x=[r["entry_time"], r["exit_time"]],
+            y=[r["entry_price"], r["exit_price"]],
+            mode="lines+markers",
+            name="Selected trade",
+            line=dict(width=4),
+            marker=dict(size=11),
+        )
+    )
+    if show_selected_sl_tp:
+        fig.add_trace(go.Scatter(x=[r["entry_time"], r["exit_time"]], y=[r["sl"], r["sl"]], mode="lines", name="Selected SL"))
+        fig.add_trace(go.Scatter(x=[r["entry_time"], r["exit_time"]], y=[r["tp"], r["tp"]], mode="lines", name="Selected TP"))
 
-
-with tab_chart:
-    st.subheader("Chart")
-    selected_abs = None
-    if not trades.empty:
-        t = trades.reset_index(drop=True)
-        view_n = int(min(len(t), st.session_state.get("ui_marker_limit", 2000)))
-        t_view = t.tail(view_n).reset_index(drop=True)
-
-        labels = [
-            f"#{(len(t)-len(t_view))+i+1} {r.side} | {r.entry_time:%Y-%m-%d %H:%M} → {r.exit_time:%Y-%m-%d %H:%M} | {r.outcome} | "
-            f"Score {r.score:.0f} | P(win) {r.p_win:.2f} | R {r.r_mult:+.2f} | {r.sig_tag} | {r.exit_model}"
-            for i, r in t_view.iterrows()
-        ]
-        selected = st.selectbox("Select a trade to highlight", ["(none)"] + labels, index=0)
-        if selected != "(none)":
-            rel = labels.index(selected)
-            selected_abs = (len(t) - len(t_view)) + rel
-
-    # ---- Chart windowing (performance) ----
-    d_chart = d_full.copy()
-    chart_window_mode = st.session_state.get("ui_chart_window", "Last N candles (fast)")
-    last_n = int(st.session_state.get("ui_chart_last_n", 3500))
-    cap_n = int(st.session_state.get("ui_chart_cap", 12000))
-
-    d_plot = d_chart
-    if str(chart_window_mode).startswith("Last"):
-        d_plot = d_chart.iloc[-last_n:].copy()
-    if len(d_plot) > cap_n:
-        d_plot = d_plot.iloc[-cap_n:].copy()
-        st.info(f"Chart capped to last {cap_n:,} candles for performance. Adjust in sidebar → Chart options.")
-
-    # ---- Build figure ----
-    fig = go.Figure()
-
-    style = str(st.session_state.get("ui_chart_style", "Candles"))
-    if style == "Close line (fast)":
-        fig.add_trace(go.Scattergl(x=d_plot["dt"], y=d_plot["close"], mode="lines", name=f"BTCUSDT ({timeframe})"))
-    elif style == "Close area (fast)":
-        fig.add_trace(go.Scattergl(x=d_plot["dt"], y=d_plot["close"], mode="lines", fill="tozeroy", name=f"BTCUSDT ({timeframe})"))
-    elif style == "OHLC":
-        fig.add_trace(go.Ohlc(
-            x=d_plot["dt"], open=d_plot["open"], high=d_plot["high"], low=d_plot["low"], close=d_plot["close"],
-            name=f"BTCUSDT ({timeframe})"
-        ))
-    elif style == "Heikin Ashi":
-        ha = heikin_ashi(d_plot)
-        fig.add_trace(go.Candlestick(
-            x=ha["dt"], open=ha["open"], high=ha["high"], low=ha["low"], close=ha["close"],
-            name=f"BTCUSDT HA ({timeframe})"
-        ))
-    else:
-        fig.add_trace(go.Candlestick(
-            x=d_plot["dt"], open=d_plot["open"], high=d_plot["high"], low=d_plot["low"], close=d_plot["close"],
-            name=f"BTCUSDT ({timeframe})"
-        ))
-
-    # Sessions (can be expensive)
-    show_sessions = bool(st.session_state.get("ui_show_sessions", True))
-    force_sessions = bool(st.session_state.get("ui_force_sessions", False))
-    session_max_days = int(st.session_state.get("ui_session_max_days", 180))
-    if show_sessions:
-        days = pd.to_datetime(d_plot["dt"]).dt.floor("D").nunique()
-        if (days > session_max_days) and (not force_sessions):
-            st.warning(f"Session overlays auto-disabled (days={days} > {session_max_days}). Enable 'Force overlays' in sidebar if needed.")
-        else:
-            fig = add_session_overlays(
-                fig, d_plot["dt"],
-                show_asia=bool(st.session_state.get("ui_show_asia", True)),
-                show_london=bool(st.session_state.get("ui_show_london", True)),
-                show_ny=bool(st.session_state.get("ui_show_ny", True)),
-            )
-
-    # Indicators (Scattergl for speed)
-    if bool(st.session_state.get("ui_show_indicators", True)):
-        for col_name, label in [
-            ("FAST", f"SMA {fast}"),
-            ("SLOW", f"SMA {slow}"),
-            ("TREND", f"SMA {trend_len}"),
-            ("EMA20", "EMA20"),
-            ("EMA50", "EMA50"),
-            ("BB_U", "BB Upper"),
-            ("BB_M", "BB Mid"),
-            ("BB_L", "BB Lower"),
-            ("VWAP", "VWAP"),
-            ("R_H", "Range High"),
-            ("R_L", "Range Low"),
-        ]:
-            if col_name in d_plot.columns:
-                fig.add_trace(go.Scattergl(x=d_plot["dt"], y=d_plot[col_name], mode="lines", name=label))
-
-    # Trade markers
-    marker_mode = st.session_state.get("ui_marker_mode", "Selected trade only (fast)")
-    show_sl_tp = bool(st.session_state.get("ui_show_sl_tp", True))
-    marker_limit = int(st.session_state.get("ui_marker_limit", 2000))
-
-    if not trades.empty and marker_mode != "Off":
-        if str(marker_mode).startswith("All"):
-            t_m = trades.tail(marker_limit).copy()
-            fig.add_trace(go.Scattergl(
-                x=t_m["entry_time"], y=t_m["entry_price"], mode="markers", name="Entries",
-                marker=dict(symbol="triangle-up", size=8)
-            ))
-            fig.add_trace(go.Scattergl(
-                x=t_m["exit_time"], y=t_m["exit_price"], mode="markers", name="Exits",
-                marker=dict(symbol="x", size=8)
-            ))
-        elif selected_abs is not None:
-            r = trades.reset_index(drop=True).iloc[int(selected_abs)]
-            fig.add_trace(go.Scattergl(x=[r["entry_time"]], y=[r["entry_price"]], mode="markers", name="Entry",
-                                      marker=dict(symbol="triangle-up", size=10)))
-            fig.add_trace(go.Scattergl(x=[r["exit_time"]], y=[r["exit_price"]], mode="markers", name="Exit",
-                                      marker=dict(symbol="x", size=10)))
-            fig.add_trace(go.Scatter(
-                x=[r["entry_time"], r["exit_time"]],
-                y=[r["entry_price"], r["exit_price"]],
-                mode="lines+markers",
-                name="Selected trade",
-                line=dict(width=4),
-                marker=dict(size=9),
-            ))
-            if show_sl_tp:
-                fig.add_trace(go.Scatter(x=[r["entry_time"], r["exit_time"]], y=[r["sl"], r["sl"]], mode="lines", name="Selected SL"))
-                fig.add_trace(go.Scatter(x=[r["entry_time"], r["exit_time"]], y=[r["tp"], r["tp"]], mode="lines", name="Selected TP"))
-
-    # ML overlay
-    if bool(st.session_state.get("ui_show_ml_overlay", True)) and use_ml and (proba is not None) and ("long_sig" in d_plot.columns):
-        sig_mask = (d_plot["long_sig"] | d_plot["short_sig"])
-        sig_points = d_plot[sig_mask].copy()
-        if len(sig_points) > 0:
-            idx = sig_points.index.to_numpy()
-            p = np.array(proba)[idx]
-            fig.add_trace(go.Scattergl(
+if show_ml_overlay and use_ml and (proba is not None) and ("long_sig" in d_chart.columns):
+    sig_mask = (d_chart["long_sig"] | d_chart["short_sig"])
+    sig_points = d_chart[sig_mask].copy()
+    if len(sig_points) > 0:
+        idx = sig_points.index.to_numpy()
+        p = np.array(proba)[idx]
+        fig.add_trace(
+            go.Scatter(
                 x=sig_points["dt"],
                 y=sig_points["close"],
                 mode="markers",
                 name="ML P(win) @ signals",
                 marker=dict(
-                    size=8, color=p, cmin=0.0, cmax=1.0, colorscale="Viridis",
-                    colorbar=dict(title="P(win)"), symbol="circle", opacity=0.9
+                    size=9,
+                    color=p,
+                    cmin=0.0,
+                    cmax=1.0,
+                    colorscale="Viridis",
+                    colorbar=dict(title="P(win)"),
+                    symbol="circle",
+                    opacity=0.9,
                 ),
                 text=[f"P(win)={pp:.2f}" if np.isfinite(pp) else "P(win)=NA" for pp in p],
                 hovertemplate="%{text}<br>%{x}<br>Close=%{y}<extra></extra>",
-            ))
-
-    fig.update_layout(
-        height=int(st.session_state.get("ui_chart_height", 720)),
-        template=plotly_template,
-        dragmode="pan",
-        xaxis_rangeslider_visible=False,
-        hovermode="x unified",
-        margin=dict(l=10, r=10, t=10, b=10),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-    )
-    fig.update_xaxes(showspikes=False)
-    fig.update_yaxes(showspikes=False)
-    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displayModeBar": True, "displaylogo": False})
-
-with tab_trades:
-    st.subheader("Trades Table")
-    if trades.empty:
-        st.write("No trades in this range with current settings.")
-    else:
-        tshow = trades.copy()
-
-        fcol1, fcol2, fcol3, fcol4 = st.columns(4)
-        with fcol1:
-            side_filter = st.multiselect("Side", ["LONG", "SHORT"], default=["LONG", "SHORT"])
-        with fcol2:
-            outcomes = sorted(tshow["outcome"].dropna().unique().tolist())
-            outcome_filter = st.multiselect("Outcome", outcomes, default=outcomes)
-        with fcol3:
-            min_score_f = st.slider("Min score (filter)", 0.0, 100.0, 0.0, 1.0)
-        with fcol4:
-            min_r_f = st.slider("Min R (filter)", -5.0, 10.0, -5.0, 0.25)
-
-        tshow = tshow[tshow["side"].isin(side_filter)]
-        tshow = tshow[tshow["outcome"].isin(outcome_filter)]
-        if "score" in tshow.columns:
-            tshow = tshow[tshow["score"].fillna(0) >= float(min_score_f)]
-        if "r_mult" in tshow.columns:
-            tshow = tshow[tshow["r_mult"].fillna(-999) >= float(min_r_f)]
-
-        for col in ["signal_time", "entry_time", "exit_time"]:
-            tshow[col] = pd.to_datetime(tshow[col]).dt.strftime("%Y-%m-%d %H:%M")
-
-        st.dataframe(tshow, use_container_width=True, hide_index=True)
-
-        st.download_button(
-            "Download trades CSV",
-            data=trades.to_csv(index=False).encode("utf-8"),
-            file_name=f"trades_{timeframe}_{strategy_name.replace(' ', '_')}.csv",
-            mime="text/csv",
+            )
         )
 
-with tab_drill:
-    st.subheader("Trade Drilldown")
+fig.update_layout(height=720, dragmode="pan", xaxis_rangeslider_visible=False, hovermode="x unified")
+fig.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor", spikedash="dot")
+fig.update_yaxes(showspikes=True, spikemode="across", spikesnap="cursor", spikedash="dot")
 
-    if trades.empty:
-        st.write("No trades to inspect.")
-    else:
-        t = trades.reset_index(drop=True)
-        idx = st.number_input("Trade #", 1, len(t), 1) - 1
-        tr = t.iloc[idx]
+st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displayModeBar": True, "displaylogo": False})
 
-        reason = {}
-        try:
-            reason = json.loads(tr.get("reason", "{}")) if pd.notna(tr.get("reason", np.nan)) else {}
-        except Exception:
-            reason = {}
+st.subheader("Trades Table")
+if trades.empty:
+    st.write("No trades in this range with current settings.")
+else:
+    tshow = trades.copy()
+    for col in ["signal_time", "entry_time", "exit_time"]:
+        tshow[col] = pd.to_datetime(tshow[col]).dt.strftime("%Y-%m-%d %H:%M")
+    st.dataframe(tshow, use_container_width=True, hide_index=True)
 
-        col1, col2 = st.columns([1, 1])
-
-        with col1:
-            st.markdown("### Entry reasoning")
-            st.write(f"**Strategy:** {reason.get('strategy','')}")
-            st.write(f"**Signal tag:** {reason.get('sig_tag','')}")
-            st.write(f"**Signal time:** {reason.get('signal_time','')}")
-            st.write(f"**Score:** {reason.get('score', '—')}  |  **Min required:** {reason.get('min_score','—')}")
-            st.write(f"**Raw trigger:** long={reason.get('raw_long', False)} short={reason.get('raw_short', False)}")
-
-            ps = reason.get("position_sizing", {})
-            if ps:
-                st.write("**Position sizing at entry:**")
-                st.write(f"- Mode: {ps.get('mode','')}")
-                st.write(f"- Equity ref: {ps.get('equity_ref','—')}")
-                st.write(f"- Risk target: {ps.get('risk_target','—')}")
-                st.write(f"- Risk actual: {ps.get('risk_actual','—')}")
-                st.write(f"- Qty (BTC): {ps.get('qty','—')}")
-                st.write(f"- Notional ($): {ps.get('notional','—')}")
-                st.write(f"- Leverage used: {ps.get('leverage_used','—')} (cap {ps.get('leverage_cap','—')})")
-                st.write(f"- Capped: {ps.get('size_capped', False)} | Min-forced: {ps.get('min_forced', False)}")
-
-            ind = reason.get("indicators", {})
-            st.write("**Indicators at signal candle:**")
-            st.write(
-                f"- RSI: {ind.get('RSI','—')}\n"
-                f"- ROC: {ind.get('ROC','—')}\n"
-                f"- VOL expansion: {ind.get('VOL_EXP','—')}\n"
-                f"- ATR: {ind.get('ATR','—')}"
-            )
-
-        with col2:
-            st.markdown("### Exit & outcome")
-            st.write(f"**Exit model:** {tr.get('exit_model','')}")
-            st.write(f"**Outcome:** {tr.get('outcome','')}")
-            st.write(f"**R multiple:** {tr.get('r_mult','—'):.2f}" if pd.notna(tr.get("r_mult", np.nan)) else "—")
-            st.write(f"**PnL ($):** {tr.get('pnl','—')}")
-            st.write(f"**Bars held:** {int(tr.get('bars_in_trade',0))}")
-            if "mfe" in tr and "mae" in tr:
-                st.write(f"**MFE:** {tr.get('mfe','—'):.2f}  |  **MAE:** {tr.get('mae','—'):.2f}")
-
-            st.markdown("**Why it won/lost (model-based):**")
-            if str(tr.get("outcome","")) in ["TP"]:
-                st.success("Price reached your take-profit before your stop (according to the candle OHLC model).")
-            elif "SL" in str(tr.get("outcome","")):
-                st.error("Price hit your stop-loss (or trailing stop) before take-profit (according to candle OHLC).")
-            elif str(tr.get("outcome","")) == "EMA_FLIP":
-                st.warning("The EMA trend flipped against the trade, so the exit model closed it early.")
-            elif str(tr.get("outcome","")) == "TIME":
-                st.warning("The time-stop closed the trade after the max holding period.")
-            else:
-                st.info("The position closed because an opposite signal/exit condition triggered.")
-
-        st.markdown("### Confluence score breakdown")
-        comps = reason.get("components", {})
-        wts = reason.get("weights", {})
-        contrib = reason.get("contribution", {})
-
-        if comps:
-            rows = []
-            for k, v in comps.items():
-                rows.append({
-                    "component": k,
-                    "value(0-1)": float(v) if v is not None else np.nan,
-                    "weight": float(wts.get(k, 0.0)),
-                    "weighted_contrib": float(contrib.get(k, 0.0)),
-                })
-            df_break = pd.DataFrame(rows).sort_values("weighted_contrib", ascending=False)
-            st.dataframe(df_break, use_container_width=True, hide_index=True)
-        else:
-            st.write("No component breakdown available for this trade (check `score_components`).")
+    st.download_button(
+        "Download trades CSV",
+        data=trades.to_csv(index=False).encode("utf-8"),
+        file_name=f"trades_{timeframe}_{strategy_name.replace(' ', '_')}.csv",
+        mime="text/csv",
+    )
